@@ -17,3 +17,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `eyes_status` tool — health check (model, device, VRAM)
 - FastMCP v3 server with STDIO transport
 - Configurable model, device, cache dir, and threshold via environment variables
+
+[1.0.0]: https://github.com/mcp-tool-shop-org/ai-eyes-mcp/releases/tag/v1.0.0

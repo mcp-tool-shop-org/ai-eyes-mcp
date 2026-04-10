@@ -1,5 +1,7 @@
 # ai-eyes-mcp
 
+**Version:** 1.0.0
+
 Grounded visual evaluator MCP server. Gives Claude honest image judgment via SigLIP2.
 
 ## The Problem
@@ -29,6 +31,8 @@ pip install -e .
 ai-eyes-mcp  # starts STDIO server
 ```
 
+Or run as a module: `python -m ai_eyes_mcp`
+
 ### Claude Code config
 
 ```json
@@ -50,8 +54,10 @@ ai-eyes-mcp  # starts STDIO server
 |---------|---------|---------|
 | `AI_EYES_MODEL_ID` | `google/siglip2-so400m-patch14-384` | HuggingFace model |
 | `AI_EYES_MODEL_DIR` | HF default cache | Model cache directory |
-| `AI_EYES_DEVICE` | `cuda` (auto-detect) | torch device |
+| `AI_EYES_DEVICE` | `auto` (cuda if available, else cpu) | torch device |
 | `AI_EYES_DEFAULT_THRESHOLD` | `0.02` | Default threshold for `image_contains` |
+
+**Logging:** The server uses Python's standard `logging` module under the logger name `ai_eyes_mcp`. To configure log level or output, use `logging.basicConfig()` or set handlers on `logging.getLogger("ai_eyes_mcp")` before starting the server.
 
 ## How Scores Work
 
@@ -64,6 +70,28 @@ SigLIP2 uses **sigmoid** scoring, not softmax. Each image-text pair gets an inde
 Scores are NOT relative. Multiple queries can score high on the same image (e.g., an image with both a sword and a shield).
 
 The default threshold (0.02) was calibrated on pixel art sprites. For photographic images, a higher threshold (0.1-0.3) may work better. The caller can override per-call.
+
+## Architecture
+
+```
+engine.py          Standalone SigLIP2 wrapper — no MCP dependency.
+                   Lazy-loads model on first inference call.
+                   Importable directly for non-MCP use cases.
+
+server.py          FastMCP wrapper that exposes engine methods as MCP tools.
+                   Thin layer: input validation, error shaping, tool metadata.
+
+__main__.py        Entry point for `python -m ai_eyes_mcp`.
+```
+
+`engine.py` is the core — it owns model loading, device selection, and all
+inference logic. `server.py` never touches torch directly; it delegates
+everything to the engine. This means you can `from ai_eyes_mcp.engine import
+SigLIPEngine` and use it in any Python script without pulling in FastMCP.
+
+The 5-to-8 direction mapping used by the sprite pipeline is NOT this tool's
+concern. ai-eyes-mcp evaluates images; direction mapping lives in the
+downstream consumer (Sprite Foundry / Game Foundry OS).
 
 ## Tool Reference
 
@@ -127,7 +155,7 @@ Score multiple images against a single query. Max 100 images per call.
 | `query` | string | yes | What to look for |
 | `threshold` | float | no | Score threshold (default 0.02) |
 
-Returns: `{query, threshold, total, scored, present, absent, errors, results: [{path, score, present}]}`
+Returns: `{query, threshold, total, scored, present, absent, errors, error_details?, results: [{path, score, present}]}`
 
 ### `eyes_status`
 
@@ -138,6 +166,8 @@ eyes_status()
 Check server status. Does not trigger model loading.
 
 Returns: `{model_id, device, loaded, cache_dir, parameters?, vram_mb?}`
+
+When `loaded` is true, also returns `parameters` (e.g., '400M') and `vram_mb` (CUDA only).
 
 ## Security and Trust
 
@@ -157,6 +187,22 @@ This tool operates **locally only**.
 - CUDA GPU recommended (~800MB VRAM at FP16)
 - CPU fallback available (slower, ~10x)
 - Model downloads ~1.6GB on first use
+
+## Development
+
+```bash
+# Install in editable mode with dev dependencies
+pip install -e ".[dev]"
+
+# Run CI-safe tests (no model required)
+pytest tests/test_edge_cases.py -v
+
+# Run all tests (requires SigLIP2 model + GPU)
+pytest tests/ -v
+
+# Full verify: imports, tools, build, edge-case tests
+bash verify.sh
+```
 
 ## License
 

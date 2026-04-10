@@ -13,6 +13,7 @@ Key design decisions:
   - Thread-safe via torch.no_grad context per call
 """
 
+import logging
 import os
 import sys
 from pathlib import Path
@@ -21,14 +22,29 @@ import numpy as np
 import torch
 from PIL import Image
 
+from ai_eyes_mcp import __version__ as _package_version
+
+logger = logging.getLogger("ai_eyes_mcp")
+
 # ---------------------------------------------------------------------------
 # Defaults (overridable via env vars)
 # ---------------------------------------------------------------------------
 
 DEFAULT_MODEL_ID = "google/siglip2-so400m-patch14-384"
+DEFAULT_MODEL_REVISION = os.environ.get("AI_EYES_MODEL_REVISION", None)
 DEFAULT_CACHE_DIR = os.environ.get("AI_EYES_MODEL_DIR", None)
 DEFAULT_DEVICE = os.environ.get("AI_EYES_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
-DEFAULT_THRESHOLD = float(os.environ.get("AI_EYES_DEFAULT_THRESHOLD", "0.02"))
+DEFAULT_DTYPE = os.environ.get("AI_EYES_DTYPE", None)  # "float16" | "bfloat16" | None (full precision)
+MAX_QUERY_LENGTH = 500  # CLIP-family tokenizers truncate beyond ~77 tokens; 500 chars is generous
+try:
+    DEFAULT_THRESHOLD = float(os.environ.get("AI_EYES_DEFAULT_THRESHOLD", "0.02"))
+except (ValueError, TypeError):
+    DEFAULT_THRESHOLD = 0.02
+    logger.warning(
+        "Invalid AI_EYES_DEFAULT_THRESHOLD (%r), using %s",
+        os.environ.get('AI_EYES_DEFAULT_THRESHOLD'),
+        DEFAULT_THRESHOLD,
+    )
 
 
 class SigLIPEngine:
@@ -41,12 +57,16 @@ class SigLIPEngine:
     def __init__(
         self,
         model_id: str = DEFAULT_MODEL_ID,
-        cache_dir: str | None = DEFAULT_CACHE_DIR,
+        cache_dir: str | Path | None = DEFAULT_CACHE_DIR,
         device: str = DEFAULT_DEVICE,
+        revision: str | None = DEFAULT_MODEL_REVISION,
+        dtype: str | None = DEFAULT_DTYPE,
     ):
         self.model_id = model_id
         self.cache_dir = cache_dir
         self.device = device
+        self.revision = revision
+        self.dtype = dtype
         self._model = None
         self._processor = None
 
@@ -55,32 +75,92 @@ class SigLIPEngine:
         return self._model is not None
 
     def _ensure_loaded(self):
-        """Load model and processor on first use."""
+        """Load model and processor on first use.
+
+        Uses local variables during the load sequence so that
+        ``self._model`` and ``self._processor`` are only set after the
+        entire chain (download, load, eval, device transfer) succeeds.
+        On any failure both attributes stay ``None`` and the next call
+        retries cleanly.
+        """
         if self._model is not None:
             return
 
         from transformers import AutoModel, AutoProcessor
 
-        print(f"[ai-eyes] Loading {self.model_id} ...", file=sys.stderr)
+        logger.info("Loading %s ...", self.model_id)
 
         kwargs = {}
         if self.cache_dir:
             kwargs["cache_dir"] = self.cache_dir
+        if self.revision:
+            kwargs["revision"] = self.revision
 
-        self._processor = AutoProcessor.from_pretrained(self.model_id, **kwargs)
-        self._model = AutoModel.from_pretrained(self.model_id, **kwargs)
-        self._model = self._model.eval().to(self.device)
+        try:
+            processor = AutoProcessor.from_pretrained(self.model_id, **kwargs)
+            model = AutoModel.from_pretrained(self.model_id, **kwargs)
+            model = model.eval().to(self.device)
+
+            # Apply dtype conversion if requested
+            if self.dtype == "float16":
+                model = model.half()
+                logger.info("Applied float16 (half precision)")
+            elif self.dtype == "bfloat16":
+                model = model.bfloat16()
+                logger.info("Applied bfloat16 precision")
+            elif self.dtype is not None:
+                logger.warning("Unknown AI_EYES_DTYPE '%s', keeping full precision", self.dtype)
+        except Exception as exc:
+            # Ensure no half-state: both stay None so next call retries.
+            self._model = None
+            self._processor = None
+            logger.error(
+                "Failed to load model '%s': %s\n"
+                "  Hints:\n"
+                "  - Check network connectivity (model may need downloading)\n"
+                "  - Check HuggingFace cache dir for corruption (%s)\n"
+                "  - Check GPU memory (device=%s) — try AI_EYES_DEVICE=cpu as fallback",
+                self.model_id,
+                exc,
+                self.cache_dir or '~/.cache/huggingface',
+                self.device,
+            )
+            raise
+
+        # Commit only after full success
+        self._processor = processor
+        self._model = model
 
         param_count = sum(p.numel() for p in self._model.parameters())
-        print(f"[ai-eyes] Loaded on {self.device}, {param_count/1e6:.0f}M params",
-              file=sys.stderr)
+        logger.info("Loaded on %s, %.0fM params", self.device, param_count / 1e6)
 
     def _load_image(self, image_path: str) -> Image.Image:
         """Load an image from path, convert to RGB."""
         path = Path(image_path)
-        if not path.exists():
+        if path.exists() and not path.is_file():
+            raise FileNotFoundError(f"Path is not a file: {image_path}")
+        if not path.is_file():
             raise FileNotFoundError(f"Image not found: {image_path}")
-        return Image.open(path).convert("RGB")
+        try:
+            return Image.open(path).convert("RGB")
+        except Image.DecompressionBombError:
+            raise ValueError(
+                f"Image too large (possible decompression bomb): {image_path}"
+            )
+        except (Image.UnidentifiedImageError, OSError) as exc:
+            raise ValueError(
+                f"Cannot open image (corrupt or unsupported format): {image_path}"
+            ) from exc
+
+    @staticmethod
+    def _validate_query(query: str) -> None:
+        """Raise ValueError for empty or excessively long queries."""
+        if not query or not query.strip():
+            raise ValueError("Query must not be empty")
+        if len(query) > MAX_QUERY_LENGTH:
+            raise ValueError(
+                f"Query too long ({len(query)} chars, max {MAX_QUERY_LENGTH})"
+            )
 
     def score(self, image_path: str, query: str) -> float:
         """Score a single image against a single text query.
@@ -88,6 +168,7 @@ class SigLIPEngine:
         Returns a sigmoid probability (0-1). Independent per query —
         not relative to other queries. Higher = stronger match.
         """
+        self._validate_query(query)
         self._ensure_loaded()
 
         image = self._load_image(image_path)
@@ -109,12 +190,25 @@ class SigLIPEngine:
 
         Returns a dict mapping each query to its independent sigmoid score.
         Scores are NOT softmax — each query is evaluated independently.
+
+        Duplicate queries are deduplicated before scoring so every unique
+        query appears exactly once in the result dict.
         """
+        for q in queries:
+            self._validate_query(q)
         self._ensure_loaded()
+
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        unique_queries: list[str] = []
+        for q in queries:
+            if q not in seen:
+                seen.add(q)
+                unique_queries.append(q)
 
         image = self._load_image(image_path)
         inputs = self._processor(
-            text=queries,
+            text=unique_queries,
             images=image,
             padding="max_length",
             return_tensors="pt",
@@ -124,19 +218,64 @@ class SigLIPEngine:
             outputs = self._model(**inputs)
             probs = torch.sigmoid(outputs.logits_per_image[0]).cpu().numpy()
 
-        return {q: float(p) for q, p in zip(queries, probs)}
+        return {q: float(p) for q, p in zip(unique_queries, probs)}
+
+    def _encode_text(self, query: str) -> dict:
+        """Encode a text query once and return the tokenized tensors.
+
+        The returned dict contains the text-side input tensors on the
+        correct device, ready to be merged with per-image inputs.
+        """
+        self._ensure_loaded()
+        text_inputs = self._processor(
+            text=[query],
+            padding="max_length",
+            return_tensors="pt",
+        ).to(self.device)
+        return text_inputs
+
+    def _score_with_text_inputs(self, image_path: str, text_inputs: dict) -> float:
+        """Score a single image using pre-encoded text tensors.
+
+        Skips text encoding — only processes the image and runs the
+        forward pass with the pre-computed text input tensors.
+        """
+        self._ensure_loaded()
+        image = self._load_image(image_path)
+        image_inputs = self._processor(
+            images=image,
+            return_tensors="pt",
+        ).to(self.device)
+
+        # Merge text and image tensors for the forward pass
+        combined = {**text_inputs, **image_inputs}
+
+        with torch.no_grad():
+            outputs = self._model(**combined)
+            prob = torch.sigmoid(outputs.logits_per_image[0, 0]).item()
+
+        return prob
 
     def score_batch(self, image_paths: list[str], query: str) -> list[float]:
         """Score multiple images against a single text query.
 
         Encodes the text once, scores each image independently.
         Returns list of sigmoid scores in same order as input paths.
+        Logs progress to stderr every 25 images for large batches.
         """
+        self._validate_query(query)
         self._ensure_loaded()
 
+        # Encode text ONCE, reuse for every image
+        text_inputs = self._encode_text(query)
+
+        total = len(image_paths)
         scores = []
-        for path in image_paths:
-            scores.append(self.score(path, query))
+        for i, path in enumerate(image_paths):
+            scores.append(self._score_with_text_inputs(path, text_inputs))
+            # Progress reporting every 25 images (skip the very last — caller sees the result)
+            if total > 1 and (i + 1) % 25 == 0 and (i + 1) < total:
+                logger.info("Batch progress: %d/%d", i + 1, total)
         return scores
 
     def embed_image(self, image_path: str) -> np.ndarray:
@@ -167,11 +306,18 @@ class SigLIPEngine:
 
     def status(self) -> dict:
         """Return engine status info."""
+        import transformers
+
         info = {
+            "ai_eyes_version": _package_version,
             "model_id": self.model_id,
             "device": self.device,
+            "dtype": self.dtype or "float32",
             "loaded": self.loaded,
             "cache_dir": self.cache_dir or "default",
+            "python_version": sys.version,
+            "torch_version": torch.__version__,
+            "transformers_version": transformers.__version__,
         }
         if self.loaded:
             param_count = sum(p.numel() for p in self._model.parameters())
