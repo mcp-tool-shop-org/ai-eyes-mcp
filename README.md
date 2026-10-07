@@ -14,6 +14,8 @@
 
 # ai-eyes-mcp
 
+This repository has moved. The package is [`ai-eyes`](https://github.com/mcp-tool-shop-org/sense-si) and the code lives in `packages/eyes`. The import stays `ai_eyes_mcp`. The primary console script is `ai-eyes`. This repository stays as the archive of the history written here.
+
 **Version:** 1.2.0
 
 Grounded visual evaluator MCP server. Gives Claude honest image judgment via SigLIP2 — it *measures*, it doesn't narrate, so it doesn't hallucinate.
